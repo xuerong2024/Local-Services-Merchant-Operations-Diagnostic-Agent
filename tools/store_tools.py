@@ -1,7 +1,8 @@
 import json
+import sqlite3
 from pathlib import Path
 from datetime import datetime
-import pandas as pd
+
 from qwen_agent.tools.base import BaseTool, register_tool
 
 # =========================
@@ -9,6 +10,9 @@ from qwen_agent.tools.base import BaseTool, register_tool
 # =========================
 _RUNTIME_LOGS = []
 _CURRENT_LOG_FILE = None
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "data" / "store_sales.db"
 
 
 def set_log_file(log_file_path: str):
@@ -41,17 +45,11 @@ def append_runtime_log(message: str):
 @register_tool("analyze_store_sales")
 class AnalyzeStoreSales(BaseTool):
     description = (
-        "分析门店经营数据。输入用户上传的数据文件路径、门店ID和开始/结束日期，"
-        "返回营收、订单、客单价、毛利率、缺货率等摘要。"
+        "分析门店经营数据。输入门店ID和开始/结束日期，"
+        "从 SQLite 数据库中查询并返回营收、订单、客单价、毛利率、缺货率等摘要。"
     )
 
     parameters = [
-        {
-            "name": "file_path",
-            "type": "string",
-            "description": "用户上传的数据文件路径，支持 CSV、XLSX、XLS",
-            "required": True,
-        },
         {
             "name": "store_id",
             "type": "string",
@@ -78,97 +76,58 @@ class AnalyzeStoreSales(BaseTool):
 
         try:
             args = json.loads(params)
-            file_path = args["file_path"]
-            store_id = args["store_id"]
+            store_id = str(args["store_id"]).strip()
             start_date = args["start_date"]
             end_date = args["end_date"]
 
-            p = Path(file_path)
-            if not p.exists():
-                err = f"文件不存在: {file_path}"
+            if not DB_PATH.exists():
+                err = f"数据库不存在: {DB_PATH}"
                 append_runtime_log(f"Tool error: {err}")
                 append_runtime_log('Finished tool calling.')
-                return json.dumps(
-                    {"success": False, "error": err},
-                    ensure_ascii=False
-                )
+                return json.dumps({"success": False, "error": err}, ensure_ascii=False)
 
-            suffix = p.suffix.lower()
-            if suffix == ".csv":
-                df = pd.read_csv(p)
-            elif suffix in [".xlsx", ".xls"]:
-                df = pd.read_excel(p)
-            else:
-                err = f"暂不支持的文件类型: {suffix}，请上传 CSV 或 Excel 文件"
-                append_runtime_log(f"Tool error: {err}")
-                append_runtime_log('Finished tool calling.')
-                return json.dumps(
-                    {"success": False, "error": err},
-                    ensure_ascii=False
-                )
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
 
-            df.columns = [str(c).strip() for c in df.columns]
+            try:
+                sql = """
+                SELECT date, store_id, sales, orders, customers, gross_margin, stockout_rate
+                FROM store_sales
+                WHERE store_id = ?
+                  AND date >= ?
+                  AND date <= ?
+                ORDER BY date ASC
+                """
+                rows = conn.execute(sql, (store_id, start_date, end_date)).fetchall()
+            finally:
+                conn.close()
 
-            required_cols = [
-                "date",
-                "store_id",
-                "sales",
-                "orders",
-                "customers",
-                "gross_margin",
-                "stockout_rate",
-            ]
-            missing = [c for c in required_cols if c not in df.columns]
-            if missing:
-                err = f"缺少必要字段: {missing}。当前列名为: {list(df.columns)}"
-                append_runtime_log(f"Tool error: {err}")
-                append_runtime_log('Finished tool calling.')
-                return json.dumps(
-                    {"success": False, "error": err},
-                    ensure_ascii=False
-                )
-
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df["store_id"] = df["store_id"].astype(str).str.strip()
-
-            for col in ["sales", "orders", "customers", "gross_margin", "stockout_rate"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            df = df.dropna(
-                subset=["date", "sales", "orders", "customers", "gross_margin", "stockout_rate"]
-            )
-
-            sub = df[
-                (df["store_id"] == str(store_id).strip())
-                & (df["date"] >= pd.to_datetime(start_date))
-                & (df["date"] <= pd.to_datetime(end_date))
-            ].copy()
-
-            if sub.empty:
+            if not rows:
                 err = f"未找到门店 {store_id} 在 {start_date} 到 {end_date} 的数据"
                 append_runtime_log(f"Tool error: {err}")
                 append_runtime_log('Finished tool calling.')
-                return json.dumps(
-                    {"success": False, "error": err},
-                    ensure_ascii=False
-                )
+                return json.dumps({"success": False, "error": err}, ensure_ascii=False)
 
-            sub = sub.sort_values("date")
+            sales_list = [float(r["sales"]) for r in rows]
+            orders_list = [int(r["orders"]) for r in rows]
+            customers_list = [int(r["customers"]) for r in rows]
+            margin_list = [float(r["gross_margin"]) for r in rows]
+            stockout_list = [float(r["stockout_rate"]) for r in rows]
 
-            total_sales = float(sub["sales"].sum())
-            total_orders = int(sub["orders"].sum())
-            total_customers = int(sub["customers"].sum())
-            avg_margin = float(sub["gross_margin"].mean())
-            avg_stockout = float(sub["stockout_rate"].mean())
+            total_sales = sum(sales_list)
+            total_orders = sum(orders_list)
+            total_customers = sum(customers_list)
+            avg_margin = sum(margin_list) / len(margin_list)
+            avg_stockout = sum(stockout_list) / len(stockout_list)
             avg_ticket = total_sales / total_orders if total_orders > 0 else 0
 
-            first_sales = float(sub.iloc[0]["sales"])
-            last_sales = float(sub.iloc[-1]["sales"])
+            first_sales = sales_list[0]
+            last_sales = sales_list[-1]
             sales_change = last_sales - first_sales
             sales_change_pct = (sales_change / first_sales) if first_sales else 0
 
-            first_orders = float(sub.iloc[0]["orders"])
-            last_orders = float(sub.iloc[-1]["orders"])
+            first_orders = orders_list[0]
+            last_orders = orders_list[-1]
             orders_change_pct = ((last_orders - first_orders) / first_orders) if first_orders else 0
 
             result = {
@@ -176,7 +135,7 @@ class AnalyzeStoreSales(BaseTool):
                 "data": {
                     "store_id": store_id,
                     "period": [start_date, end_date],
-                    "days": int(len(sub)),
+                    "days": len(rows),
                     "total_sales": round(total_sales, 2),
                     "total_orders": total_orders,
                     "total_customers": total_customers,
@@ -190,8 +149,8 @@ class AnalyzeStoreSales(BaseTool):
                         "change_pct": round(sales_change_pct, 4),
                     },
                     "orders_trend": {
-                        "first_day_orders": int(first_orders),
-                        "last_day_orders": int(last_orders),
+                        "first_day_orders": first_orders,
+                        "last_day_orders": last_orders,
                         "change_pct": round(orders_change_pct, 4),
                     }
                 }
@@ -210,9 +169,6 @@ class AnalyzeStoreSales(BaseTool):
             append_runtime_log(f"Tool exception: {str(e)}")
             append_runtime_log('Finished tool calling.')
             return json.dumps(
-                {
-                    "success": False,
-                    "error": f"工具执行失败: {str(e)}"
-                },
+                {"success": False, "error": f"工具执行失败: {str(e)}"},
                 ensure_ascii=False
             )

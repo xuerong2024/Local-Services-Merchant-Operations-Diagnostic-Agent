@@ -8,6 +8,7 @@ import gradio as gr
 from dotenv import load_dotenv
 from qwen_agent.agents import Assistant
 from pathlib import Path
+import tools.rag_tools as rag_tools
 
 BASE_DIR = Path(__file__).resolve().parent
 DEMO_FILE = BASE_DIR / "data" / "store_sales.csv"
@@ -40,32 +41,31 @@ system_message = """
 
 你的职责：
 1. 理解用户提出的经营问题；
-2. 必要时调用工具读取和分析门店数据；
-3. 给出清晰的诊断结论；
-4. 提供可执行的经营建议。
+2. 必要时调用 analyze_store_sales 查询门店经营数据；
+3. 必要时调用 retrieve_operation_knowledge 检索运营知识；
+4. 基于数据和知识给出清晰诊断与可执行建议。
 
 非常重要的规则：
-- 用户会上传一个 CSV 或 Excel 文件。
-- 当你调用 analyze_store_sales 工具时，必须把当前上传文件路径作为 file_path 参数传入。
+- analyze_store_sales 用于获取门店经营指标与趋势。
+- retrieve_operation_knowledge 用于检索经营优化经验、规则和案例。
+- 如果用户的问题既需要看数据，也需要给建议，优先结合两个工具。
 - 如果工具返回 success=false 或 error，不要编造结论，要明确说明错误原因。
-- 如果用户只问“最近一周经营表现怎么样”，你不能使用现实世界时间。
-- 你必须基于上传数据中的实际日期范围理解“最近一周”：
-  - 若用户说“最近一周”，请以数据中的最晚日期为基准，向前取7天。
-  - 若数据不足7天，则基于已有日期范围分析。
-- 如果用户明确给出日期范围，则优先使用用户给定范围。
-- 输出请尽量采用以下结构：
+- 输出尽量采用以下结构：
   - 问题判断
   - 关键发现
   - 可能原因
   - 建议动作
+  - 参考依据
 """
 
 bot = Assistant(
     llm=llm_cfg,
     system_message=system_message,
-    function_list=["analyze_store_sales"]
+    function_list=[
+        "analyze_store_sales",
+        "retrieve_operation_knowledge",
+    ]
 )
-
 
 def normalize_history(history):
     messages = []
@@ -175,40 +175,23 @@ def format_tool_logs_for_display(logs):
     return "\n".join(lines)
 
 
-def run_agent_with_upload(message, history, uploaded_file):
-    if not uploaded_file:
-        return "请先上传一个 CSV 或 Excel 文件，再提问。"
-
-    file_path = str(uploaded_file)
-
+def run_agent(message, history):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = LOG_DIR / f"agent_run_{timestamp}.log"
 
-    # 初始化本次请求的工具日志
     store_tools.clear_runtime_logs()
+    rag_tools.clear_runtime_logs()
+
     store_tools.set_log_file(str(log_file))
-
-    data_date_hint = get_data_date_hint(file_path)
-
-    merged_system_message = f"""
-{system_message}
-
-补充上下文：
-- 当前用户已上传数据文件，路径为：{file_path}
-- 当你调用 analyze_store_sales 工具时，必须把这个路径作为 file_path 参数传入
-- {data_date_hint}
-"""
+    rag_tools.set_log_file(str(log_file))
 
     messages = [
-        {"role": "system", "content": merged_system_message},
+        {"role": "system", "content": system_message},
     ]
     messages.extend(normalize_history(history))
     messages.append({"role": "user", "content": message})
 
-    # 写入应用级日志
     save_app_log(log_file, f"[APP] 用户问题: {message}")
-    save_app_log(log_file, f"[APP] 上传文件: {file_path}")
-    save_app_log(log_file, f"[APP] 日期提示: {data_date_hint}")
 
     try:
         final_resp = None
@@ -218,92 +201,56 @@ def run_agent_with_upload(message, history, uploaded_file):
         answer = extract_text_from_response(final_resp)
         tool_logs = store_tools.get_runtime_logs()
         display_logs = format_tool_logs_for_display(tool_logs)
+        for resp in bot.run(messages=messages):
+            print("RAW RESP:", resp)
+            final_resp = resp
 
         save_app_log(log_file, f"[APP] 最终回答:\n{answer}")
 
         if display_logs:
-            final_text = (
-                f"{display_logs}\n\n"
-                f"[日志文件]\n{log_file}\n\n"
-                f"{answer}"
-            )
-        else:
-            final_text = (
-                f"[日志文件]\n{log_file}\n\n"
-                f"{answer}"
-            )
-
-        return final_text
+            return f"{display_logs}\n\n[日志文件]\n{log_file}\n\n{answer}"
+        return f"[日志文件]\n{log_file}\n\n{answer}"
 
     except Exception as e:
         err_msg = f"运行失败：{str(e)}"
         save_app_log(log_file, f"[APP] 异常: {err_msg}")
-
-        tool_logs = store_tools.get_runtime_logs()
-        display_logs = format_tool_logs_for_display(tool_logs)
-
-        if display_logs:
-            return f"{display_logs}\n\n[日志文件]\n{log_file}\n\n{err_msg}"
         return f"[日志文件]\n{log_file}\n\n{err_msg}"
-
-
 import gradio as gr
 
 def use_demo_file():
     return str(DEMO_FILE)
 
 with gr.Blocks() as demo:
-    gr.Markdown("## 门店经营分析 Agent")
-
-    gr.Markdown("### 1️⃣ 上传数据 或 使用示例数据")
-
-    file_input = gr.File(
-        label="上传门店经营数据（CSV / Excel）",
-        file_count="single",
-        type="filepath"
-    )
-
-    demo_btn = gr.Button("👉 使用示例数据（store_sales.csv）")
-
-    # 点击按钮时，把示例文件路径写入 file_input
-    demo_btn.click(
-        fn=use_demo_file,
-        inputs=[],
-        outputs=file_input
-    )
-
-    gr.Markdown("### 2️⃣ 提问")
+    gr.Markdown("## 门店经营分析 Agent（SQLite版）")
 
     chatbot = gr.Chatbot(type="messages")
     msg = gr.Textbox(placeholder="例如：S001 在 2026-03-01 到 2026-03-03 的经营表现怎么样？")
     send_btn = gr.Button("发送")
 
-    def chat_fn(message, history, uploaded_file):
-        response = run_agent_with_upload(message, history, uploaded_file)
-
+    def chat_fn(message, history):
+        response = run_agent(message, history)
         history = history or []
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant", "content": response})
-
         return history, ""
 
     send_btn.click(
         fn=chat_fn,
-        inputs=[msg, chatbot, file_input],
+        inputs=[msg, chatbot],
         outputs=[chatbot, msg]
     )
 
     msg.submit(
         fn=chat_fn,
-        inputs=[msg, chatbot, file_input],
+        inputs=[msg, chatbot],
         outputs=[chatbot, msg]
     )
-
-demo.launch(
-    server_name="127.0.0.1",
-    server_port=7860,
-    debug=True
-)
+# demo.launch(
+#     server_name="127.0.0.1",
+#     server_port=7860,
+#     debug=True
+# )
+demo.launch(share=True)
 
 if __name__ == "__main__":
     demo.launch(
