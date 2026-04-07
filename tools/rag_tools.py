@@ -57,7 +57,7 @@ def need_web_fallback(query: str, local_results: list) -> bool:
 
 from tavily import TavilyClient
 
-tavily_client = TavilyClient(api_key="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")
+tavily_client = TavilyClient(api_key="tvly-dev-***") # Your tvly API key
 
 def search_web(query: str, top_k: int = 3) -> list:
     append_runtime_log(f'Executing web search for query: {query}')
